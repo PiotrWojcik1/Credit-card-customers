@@ -1,0 +1,323 @@
+---
+title: "Credit card customers - analiza"
+author: "Piotr Wójcik"
+output:
+  html_document:
+    df_print: paged
+---
+```{r, echo = FALSE}
+options("scipen"=100, "max.print" = 1000)
+suppressMessages(library(ggplot2))
+suppressMessages(library(pROC))
+suppressMessages(library(psych))
+suppressMessages(library(dplyr))
+suppressMessages(library(glmulti))
+suppressMessages(library(HH))
+suppressMessages(library(kableExtra))
+```
+<font size="+0.5">
+<p>W poniższym raporcie przeanalizujemy zbiór danych dotyczący klientów banku. Skupimy się na wyznaczeniu prawdopodobieństwa zdarzenia, że klient zakończy relację z bankiem. Dla każdego klienta posiadamy podstawowe informacje demograficzne jak wiek czy płeć, informacje produktowe oraz transakcyjne.</p>
+```{r}
+data <- read.table("BankChurners.csv", sep = ',', header = TRUE)
+data <- data[,1:21]
+head(data)
+```
+<p>Analizę zaczniemy od sprawdzenia czy nie ma brakujących danych.</p>
+```{r}
+sapply(names(data), function(x) x = nrow(data[is.na(data[,x]),]))
+```
+<p>Widzimy, że nie ma brakujących danych w naszym zbiorze danych. Istnieją jednak trzy zmienne, w których znajdują się wartości <em>"Unknown"</em>. Są to <em>Education level</em>, <em>Marital status</em> oraz <em>Income category</em>.</p>
+```{r}
+length(data$Education_Level[data$Education_Level == "Unknown"]) #1519 klientów z nieznanym wykształceniem
+
+length(data$Marital_Status[data$Marital_Status == "Unknown"]) #749 klientów z nieznanym stanem cywilnym
+
+length(data$Income_Category[data$Income_Category == "Unknown"]) #1112 klientów z nieznanym przedziałem zarobków
+```
+<p>Jeżeli powyższe zmienne okażą się istotne w procesie uczenia, to wtedy lepiej spróbujemy zrozumieć ich strukturę.</p>
+<p>Jako model predykcyjny użyjemy regresję logistyczną. Stąd aby skonstruować model potrzebujemy mieć wszystkie dane w formie liczbowej.</p>
+```{r}
+data$Attrition_Flag <- as.integer(factor(data$Attrition_Flag, levels = c("Existing Customer", "Attrited Customer"))) - 1 #Exisitng customer = 0
+data$Gender <- as.integer(factor(data$Gender)) - 1 #men = 1
+data$Education_Level <- as.integer(factor(data$Education_Level))
+data$Marital_Status <- as.integer(factor(data$Marital_Status))
+data$Income_Category <- as.integer(factor(data$Income_Category))
+data$Card_Category <- as.integer(factor(data$Card_Category))
+```
+<p>Teraz, kiedy wszystkie zmienne są zamienione na liczbowe możemy sprawdzić, czy między naszymi zmiennymi nie zachodzi silna korelacja, co jest przeciwwskazane w regresji logistycznej. W tym celu wyznaczymy korelację pomiędzy poszczególnymi zmiennymi i zestawimy je na wykresie:</p>
+```{r, fig.width = 10, fig.height = 10}
+corPlot(data, xlas = 2, n = 100, show.legend = FALSE, scale = FALSE, cex = 0.75, alpha = 0.65)
+```
+<p>Jak widać, zachodzi silna korelacja pomiędzy zmiennymi Avg_open_to_buy oraz Credit_Limit. Stąd nie powinniśmy brać jednej z nich do modelu. Poza tym mamy wysoką korelację dla zmiennych Total_trnas_Ct oraz Total_trans_amt wynoszącą $\small 0.81$, oraz dla zmiennych Months_on_book i Customer_age wynoszącą $\small 0.79$. W związku z tym przy konstruowaniu modelu należy zwrócić uwagę, czy te zmienne nie wpłyną negatywnie na nasze predykcje.</p>
+<p>Zajmiemy się teraz doborem istotnych zmiennych z całego zbioru 19 zmiennych opisujących klienta, aby nie doprowadzić do sytuacji tak zwanego <em>overfitting'u</em>.</p>
+```{r, fig.width = 12, fig.height = 10}
+best_model <- suppressMessages(glmulti("Attrition_Flag", xr = names(data[3:21]), data = data[,2:21], popsize = 50, level = 1, method = "g", plotty = FALSE, marginality = TRUE, deltaB = 0, confsetsize = 1, deltaM = 1000, family = "binomial", report = FALSE)) #szukanie optymalnego modelu
+
+relevant_variables <- c("CLIENTNUM", "Attrition_Flag", "Gender", "Dependent_count", "Marital_Status", "Months_on_book", "Total_Relationship_Count", "Months_Inactive_12_mon", "Contacts_Count_12_mon", "Total_Revolving_Bal", "Total_Amt_Chng_Q4_Q1", "Total_Trans_Amt", "Total_Trans_Ct", "Total_Ct_Chng_Q4_Q1")
+
+reduced_data <- data[relevant_variables] #zredukowanie zbioru do istotnych zmiennych
+```
+<p>Ze zbioru 19 zmiennych, istotnymi okazały się tylko poniższe 12 zmiennych:</p>
+```{r, echo = FALSE}
+opisy <- c("Gender of customer", "Number of dependents", "Married, Single, Divorced, Unknown", "Period of relationship with bank", "Total no. of products held by the customer", "No. of months inactive in the last 12 months", "No. of Contacts in the last 12 months", "Total Revolving Balance on the Credit Card", "Change in Transaction Amount (Q4 over Q1)", "Total Transaction Amount (Last 12 months)", "Total Transaction Count (Last 12 months)", "Change in Transaction Count (Q4 over Q1)")
+knitr::kable(data.frame("Variables" = relevant_variables[3:14], "Descriptions" = opisy), format = "pipe")
+```
+<p>Skonstruujemy więc model regresji logistycznej z wykorzystaniem powyższych zmiennych. Podzielimy nasz zbiór obserwacji, tak aby 90% z nich było wykorzystane do uczenia, natomiast pozostałe 10% użyjemy do testowania. Dane jakie uzyskaliśmy, zostały wprowadzone w sposób zależny. Aby to zobrazować, wyznaczymy na wykresie zmienną <em>Total_Trans_Ct</em> w kolejności występowania w zbiorze</p>
+```{r}
+plot(reduced_data$Total_Trans_Ct)
+```
+<p>Wyraźnie widać strukturowość danych. Wykreślimy ponownie ten sam zbiór, ale wcześniej przemieszając go.</p>
+```{r}
+plot(sample(reduced_data$Total_Trans_Ct))
+```
+<p>Aby nasz model mógł prawidłowo działać, potrzebujemy aby każda obserwacja była niezależna od położenia w zbiorze. Przemieszamy zatem cały zbiór ćwiczeniowy zanim zaczniemy konstruować model.</p>
+```{r}
+reduced_data <- reduced_data[sample(1:nrow(reduced_data)),] #permutacja zbioru
+
+Existing_customers_data <- reduced_data[reduced_data$Attrition_Flag == 0,] #wyodrębnienie klientów którzy zrezygnowali 
+Attrited_customers_data <- reduced_data[reduced_data$Attrition_Flag == 1,] #wyodrębnienie klientów którzy nie zrezygnowali
+
+training_set <- rbind(Existing_customers_data[sample(1:nrow(Existing_customers_data), 0.9*nrow(Existing_customers_data)),],
+                      Attrited_customers_data[sample(1:nrow(Attrited_customers_data), 0.9*nrow(Attrited_customers_data)),]) #zbiór treningowy
+
+test_set <- anti_join(reduced_data, training_set, by='CLIENTNUM') #zbiór testowy (dopełnienie zbioru treningowego)
+
+reduced_model <- glm(Attrition_Flag~. , data = training_set[2:14], family = "binomial") #model regresji logistycznej
+```
+<p>Z wszystkich 12 istotnych zmiennych nasz model wytypował poniższe pięć najistotniejszych zmiennych w kolejności od najistotniejszej:</p>
+<ul>
+<li><em>Total_Trans_Ct</em>, czyli ilość transakcji w roku,</li>
+<li><em>Total_Trans_Amt</em>, czyli całkowita kwota transakcji w roku,</li>
+<li><em>Total_Revolving_Bal</em>, czyli całkowita kwota kredytu odnawialnego,</li>
+<li><em>Total_Relationship_Count</em>, czyli liczba produktów posiadanych przez klienta,</li>
+<li><em>Total_Ct_Chng_Q4_Q1</em>, czyli całkowita różnica w ilości transakcji na przełomie czwartego i pierwszego kwartału (Q4 over Q1).</li>
+</ul>
+
+<h2>Analiza Modelu</h2>
+<p>Jak zauważyliśmy wcześniej, między pewnymi zmiennymi zachodzi duża korelacja, w tym dwie silnie skorelowane zmienne zostały wytypowane do naszego modelu. Sprawdzimy, czy zachodzi problem z multikolinearnością wykorzystując miarę <em>VIF</em> na naszym modelu predykcyjnym.</p>
+```{r}
+tolerance <- 1/vif(reduced_model) #tolerancja modelu (odwrotność miary VIF)
+tolerance
+```
+<p>Wartości poniżej $\small 0.1$ wskazują na poważny problem z multikolinearnością. W naszym modelu nie zachodzi taka sytuacja.</p>
+<p>Sprawdzimy teraz na zbiorze testowym jak radzi sobie nasz model.</p>
+```{r}
+probabilities <- predict(reduced_model, newdata = test_set[3:14], type = "response") #prawdopodbieństwo zdarzenia, że klient zakończy relację z bankiem
+test_set$probabilities <- probabilities
+
+false_discoveries_existing <- sum(test_set$probabilities > 0.5 & test_set$Attrition_Flag == 0) #klienci z dużym prawdopodobieństwem odejścia, którzy nie zrezygnowali
+false_discoveries_attrited <- sum(test_set$probabilities <= 0.5 & test_set$Attrition_Flag == 1) #klienci z małym prawdopodobieństwem odejścia, którzy zrezygnowali
+```
+<p>Skuteczność rozważanego modelu wynosi $\small `r (nrow(test_set) - false_discoveries_existing - false_discoveries_attrited)/nrow(test_set)`$, zakładając, że jeżeli prawdopodobieństwo odejścia klienta z banku jest większe niż 0.5, to klient zakończył relację z bankiem.</p>
+<p>Przeanalizujemy teraz, jak nasz model zachowuje się przy sztucznie wygenerowanych danych rozdzielając klientów względem płci.</p>
+<p>Dla każdego z klientów weźmiemy średnią ze zmiennych, których nie będziemy analizować w danym momencie, aby uzyskać "typowego" klienta banku.</p>
+```{r}
+
+generate_predictions <- function(Gender = 1,
+                                 Dependent_count = mean(reduced_data$Dependent_count),
+                                 Marital_Status = mean(reduced_data$Marital_Status),
+                                 Months_on_book = mean(reduced_data$Months_on_book),
+                                 Total_Relationship_Count = mean(reduced_data$Total_Relationship_Count),
+                                 Months_Inactive_12_mon = mean(reduced_data$Months_Inactive_12_mon),
+                                 Contacts_Count_12_mon = mean(reduced_data$Contacts_Count_12_mon),
+                                 Total_Revolving_Bal = mean(reduced_data$Total_Revolving_Bal),
+                                 Total_Amt_Chng_Q4_Q1 = mean(reduced_data$Total_Amt_Chng_Q4_Q1),
+                                 Total_Trans_Amt = mean(reduced_data$Total_Trans_Amt),
+                                 Total_Trans_Ct = mean(reduced_data$Total_Trans_Ct),
+                                 Total_Ct_Chng_Q4_Q1 = mean(reduced_data$Total_Ct_Chng_Q4_Q1)) #funkcja generująca ramkę danych klientów
+{
+  data_frame <- reduced_data[NULL,]
+  data_frame <- data_frame %>%
+    add_row(Gender = Gender,
+            Dependent_count = Dependent_count,
+            Marital_Status = Marital_Status,
+            Months_on_book = Months_on_book,
+            Total_Relationship_Count = Total_Relationship_Count,
+            Months_Inactive_12_mon = Months_Inactive_12_mon,
+            Contacts_Count_12_mon = Contacts_Count_12_mon,
+            Total_Revolving_Bal = Total_Revolving_Bal,
+            Total_Amt_Chng_Q4_Q1 = Total_Amt_Chng_Q4_Q1,
+            Total_Trans_Amt = Total_Trans_Amt,
+            Total_Trans_Ct = Total_Trans_Ct,
+            Total_Ct_Chng_Q4_Q1 = Total_Ct_Chng_Q4_Q1)
+  
+  return(data_frame)
+}
+
+```
+<h4>Analiza modelu względem ilości transakcji</h4>
+<p>Analizę zaczniemy od najistotniejszego czynnika w naszych predykcjach, czyli ilości transakcji jakie wykonał klient w ciągu ostatniego roku. Jak wspomnieliśmy, pozostałe zmienne ustalimy jako średnia, w celu uzyskania najoptymalniejszych wyników dla analizowanej zmiennej. Na wykresie zaprezentujemy prawdopodobieństwo zależne od tego jak zmienia się ilość transakcji.</p>
+```{r, fig.width = 12, fig.height = 7}
+Total_Trans_Ct_predictions_men <- generate_predictions(Total_Trans_Ct = seq(5,100,1))
+Total_Trans_Ct_predictions_women <- generate_predictions(Gender = 0, Total_Trans_Ct = seq(5,100,1))
+
+plot(predict(reduced_model, newdata = Total_Trans_Ct_predictions_men[3:14], type = "response")~seq(5,100,1), pch = 16, xlab = "ilość transakcji", ylab = "prawdopodobieństwo rezygnacji")
+points(predict(reduced_model, newdata = Total_Trans_Ct_predictions_women[3:14], type = "response")~seq(5,100,1), col = "red", pch = 16)
+legend("topright", legend = c("kobiety", "mężczyźni"), col = c("red", "black"), pch = 16)
+```
+<p>Możemy zauważyć, że wraz ze spadkiem ilości transakcji w roku, drastycznie wzrasta prawdopodobieństwo zdarzenia, że klient zakończy relację z bankiem. Możemy też zauważyć, że kobiety zdecydowanie chętniej rezygnują od mężczyzn.</p>
+
+<h4>Analiza modelu względem całkowitej kwoty transakcji</h4>
+<p>Ponieważ całkowita kwota transakcji w roku jest silnie skorelowana z wcześniej analizowaną ilością tansakcji w roku, stąd powinniśmy spodziewać się analogicznych wyników także w tym przypadku.</p>
+```{r, fig.width = 12, fig.height = 7}
+Total_Trans_Amt_predictions_men <- generate_predictions(Total_Trans_Amt = seq(510,18484,179.74))
+Total_Trans_Amt_predictions_women <- generate_predictions(Gender = 0, Total_Trans_Amt = seq(510,18484,179.74))
+
+plot(predict(reduced_model, newdata = Total_Trans_Amt_predictions_men[3:14], type = "response")~seq(510,18484,179.74), pch = 16, xlab = "całkowita kwota transakcji", ylab = "prawdopodobieństwo rezygnacji")
+points(predict(reduced_model, newdata = Total_Trans_Amt_predictions_women[3:14], type = "response")~seq(510,18484,179.74), col = "red", pch = 16)
+legend("topleft", legend = c("kobiety", "mężczyźni"), col = c("red", "black"), pch = 16)
+```
+<p>Wynik jest dość zaskakujący, sugerujący, że wraz ze wzrostem całkowitej kwoty transakcji, rośnie prawdopodobieństwo odejścia klienta z banku. Jest to jednak sytuacja przy założeniu, że jest to klient bardzo typowy pod każdym innym względem. Aby lepiej zrozumieć sytuację wyznaczymy jeszcze kilka takich wykresów, zmieniając ilość transakcji w roku.</p>
+```{r, fig.width = 12, fig.height = 12}
+Total_Trans_Amt_predictions_men <- generate_predictions(Total_Trans_Amt = seq(510,18484,179.74), Total_Trans_Ct = 20)
+Total_Trans_Amt_predictions_women <- generate_predictions(Gender = 0, Total_Trans_Amt = seq(510,18484,179.74), Total_Trans_Ct = 20)
+
+par(mfrow = c(2,2))
+plot(predict(reduced_model, newdata = Total_Trans_Amt_predictions_women[3:14], type = "response")~seq(510,18484,179.74), col = "red", pch = 16, xlab = "całkowita kwota transakcji", ylab = "prawdopodobieństwo rezygnacji", main = "Ilość transakcji: 20", ylim = c(0,1))
+points(predict(reduced_model, newdata = Total_Trans_Amt_predictions_men[3:14], type = "response")~seq(510,18484,179.74), pch = 16)
+legend("topleft", legend = c("kobiety", "mężczyźni"), col = c("red", "black"), pch = 16)
+
+Total_Trans_Amt_predictions_men <- generate_predictions(Total_Trans_Amt = seq(510,18484,179.74), Total_Trans_Ct = 50)
+Total_Trans_Amt_predictions_women <- generate_predictions(Gender = 0, Total_Trans_Amt = seq(510,18484,179.74), Total_Trans_Ct = 50)
+
+plot(predict(reduced_model, newdata = Total_Trans_Amt_predictions_women[3:14], type = "response")~seq(510,18484,179.74), col = "red", pch = 16, xlab = "całkowita kwota transakcji", ylab = "prawdopodobieństwo rezygnacji", main = "Ilość transakcji: 50", ylim = c(0,1))
+points(predict(reduced_model, newdata = Total_Trans_Amt_predictions_men[3:14], type = "response")~seq(510,18484,179.74), pch = 16)
+legend("topleft", legend = c("kobiety", "mężczyźni"), col = c("red", "black"), pch = 16)
+
+Total_Trans_Amt_predictions_men <- generate_predictions(Total_Trans_Amt = seq(510,18484,179.74), Total_Trans_Ct = 100)
+Total_Trans_Amt_predictions_women <- generate_predictions(Gender = 0, Total_Trans_Amt = seq(510,18484,179.74), Total_Trans_Ct = 100)
+
+plot(predict(reduced_model, newdata = Total_Trans_Amt_predictions_women[3:14], type = "response")~seq(510,18484,179.74), col = "red", pch = 16, xlab = "całkowita kwota transakcji", ylab = "prawdopodobieństwo rezygnacji", main = "Ilość transakcji: 100", ylim = c(0,1))
+points(predict(reduced_model, newdata = Total_Trans_Amt_predictions_men[3:14], type = "response")~seq(510,18484,179.74), pch = 16)
+legend("topleft", legend = c("kobiety", "mężczyźni"), col = c("red", "black"), pch = 16)
+
+Total_Trans_Amt_predictions_men <- generate_predictions(Total_Trans_Amt = seq(510,18484,179.74), Total_Trans_Ct = 120)
+Total_Trans_Amt_predictions_women <- generate_predictions(Gender = 0, Total_Trans_Amt = seq(510,18484,179.74), Total_Trans_Ct = 120)
+
+plot(predict(reduced_model, newdata = Total_Trans_Amt_predictions_women[3:14], type = "response")~seq(510,18484,179.74), col = "red", pch = 16, xlab = "całkowita kwota transakcji", ylab = "prawdopodobieństwo rezygnacji", main = "Ilość transakcji: 120", ylim = c(0,1))
+points(predict(reduced_model, newdata = Total_Trans_Amt_predictions_men[3:14], type = "response")~seq(510,18484,179.74), pch = 16)
+legend("topleft", legend = c("kobiety", "mężczyźni"), col = c("red", "black"), pch = 16)
+```
+<p>Tutaj już wyraźnie widać, że jeżeli transakcji jest bardzo mało, to prawdopodobieństwo odejścia klienta z banku rośnie gwałtownie wraz ze wzrostem całkowitej kwoty transakcji w roku. Oznacza to prawdopodobnie transfer środków z jednego konta na inne. Sytuacja jednak zmienia się wraz ze wzrostem transakcji w roku. Przy 120 transakcjach w roku prawdopodobieństwo odejścia klienta już nie przekroczyło $\small 0.2$.</p>
+
+<h4>Analiza modelu względem całkowitej kwoty kredytu odnawialnego</h4>
+<p>Przeanalizujemy teraz zmienną opisującą całkowitą kwotę kredytu odnawialnego przy różnej ilości transakcji w roku.</p>
+```{r, fig.width = 12, fig.height = 7}
+Total_Revolving_Bal_predictions_men_1 <- generate_predictions(Total_Revolving_Bal = seq(0,2517,25.17), Total_Trans_Ct = 5)
+
+Total_Revolving_Bal_predictions_men_2 <- generate_predictions(Total_Revolving_Bal = seq(0,2517,25.17), Total_Trans_Ct = 10)
+
+Total_Revolving_Bal_predictions_men_3 <- generate_predictions(Total_Revolving_Bal = seq(0,2517,25.17), Total_Trans_Ct = 30)
+
+Total_Revolving_Bal_predictions_men_4 <- generate_predictions(Total_Revolving_Bal = seq(0,2517,25.17), Total_Trans_Ct = 40)
+
+Total_Revolving_Bal_predictions_men_5 <- generate_predictions(Total_Revolving_Bal = seq(0,2517,25.17), Total_Trans_Ct = 80)
+
+Total_Revolving_Bal_predictions_men_6 <- generate_predictions(Total_Revolving_Bal = seq(0,2517,25.17), Total_Trans_Ct = 100)
+
+plot(predict(reduced_model, newdata = Total_Revolving_Bal_predictions_men_1[3:14], type = "response")~seq(0,2517,25.17), type = "b", ylim = c(0,1), pch = 16, xlab = "całkowita kwota kredytu odnawialnego", ylab = "prawdopodobieństwo rezygnacji")
+points(predict(reduced_model, newdata = Total_Revolving_Bal_predictions_men_2[3:14], type = "response")~seq(0,2517,25.17), type = "b", col = "red", pch = 16)
+points(predict(reduced_model, newdata = Total_Revolving_Bal_predictions_men_3[3:14], type = "response")~seq(0,2517,25.17), type = "b", col = "green", pch = 16)
+points(predict(reduced_model, newdata = Total_Revolving_Bal_predictions_men_4[3:14], type = "response")~seq(0,2517,25.17), type = "b", col = "purple", pch = 16)
+points(predict(reduced_model, newdata = Total_Revolving_Bal_predictions_men_5[3:14], type = "response")~seq(0,2517,25.17), type = "b", col = "orange", pch = 16)
+points(predict(reduced_model, newdata = Total_Revolving_Bal_predictions_men_6[3:14], type = "response")~seq(0,2517,25.17), type = "b", col = "blue", pch = 16)
+legend(2300, 0.8, title = "Ilość transakcji", legend = c("5", "10", "30", "40", "80", "100"), col = c("black","red", "green", "purple", "orange", "blue"), pch = 16)
+```
+<p>Jak widać, przy bardzo małych i bardzo dużych ilościach transakcji w roku, prawdopodobieństwo rezygnacji z banku zdominowane jest przez nie. Jednak kiedy klient ma w okolicach 35 transakcji w roku, możemy zauważyć, że prawdopodobieństwo rezygnacji klienta z banku maleje wraz ze wzrostem całkowitej kwoty kredytu odnawialnego.</p>
+
+<h4>Analiza modelu względem posiadanej ilości produktów</h4>
+<p>Przeanalizujemy nasz model w sytuacji, kiedy ilość transakcji nie dominuje prawdopodobieństwa rezygnacji z banku, w zależności od ilości produktów posiadanych przez klienta, przy różnej całkowitej kwocie kredytu odnawialnego.</p>
+```{r, fig.width = 12, fig.height = 7}
+Total_Relationship_Count_predictions_men_0 <- generate_predictions(Total_Relationship_Count = seq(1,6,1), Total_Trans_Ct = 30, Total_Revolving_Bal = 0)
+Total_Relationship_Count_predictions_men_1 <- generate_predictions(Total_Relationship_Count = seq(1,6,1), Total_Trans_Ct = 30, Total_Revolving_Bal = 500)
+Total_Relationship_Count_predictions_men_2 <- generate_predictions(Total_Relationship_Count = seq(1,6,1), Total_Trans_Ct = 30, Total_Revolving_Bal = 900)
+Total_Relationship_Count_predictions_men_3 <- generate_predictions(Total_Relationship_Count = seq(1,6,1), Total_Trans_Ct = 30, Total_Revolving_Bal = 1500)
+Total_Relationship_Count_predictions_men_4 <- generate_predictions(Total_Relationship_Count = seq(1,6,1), Total_Trans_Ct = 30, Total_Revolving_Bal = 2000)
+Total_Relationship_Count_predictions_men_5 <- generate_predictions(Total_Relationship_Count = seq(1,6,1), Total_Trans_Ct = 30, Total_Revolving_Bal = 6000)
+Total_Relationship_Count_predictions_men_6 <- generate_predictions(Total_Relationship_Count = seq(1,6,1), Total_Trans_Ct = 30, Total_Revolving_Bal = 12000)
+
+plot(predict(reduced_model, newdata = Total_Relationship_Count_predictions_men_1[3:14], type = "response")~seq(1,6,1), type = "b", ylim = c(0,1), pch = 16, xlab = "Ilość posiadanych produktów", ylab = "prawdopodobieństwo rezygnacji")
+points(predict(reduced_model, newdata = Total_Relationship_Count_predictions_men_0[3:14], type = "response")~seq(1,6,1), type = "b", col = "brown", pch = 16)
+points(predict(reduced_model, newdata = Total_Relationship_Count_predictions_men_2[3:14], type = "response")~seq(1,6,1), type = "b", col = "red", pch = 16)
+points(predict(reduced_model, newdata = Total_Relationship_Count_predictions_men_3[3:14], type = "response")~seq(1,6,1), type = "b", col = "green", pch = 16)
+points(predict(reduced_model, newdata = Total_Relationship_Count_predictions_men_4[3:14], type = "response")~seq(1,6,1), type = "b", col = "purple", pch = 16)
+points(predict(reduced_model, newdata = Total_Relationship_Count_predictions_men_5[3:14], type = "response")~seq(1,6,1), type = "b", col = "orange", pch = 16)
+points(predict(reduced_model, newdata = Total_Relationship_Count_predictions_men_6[3:14], type = "response")~seq(1,6,1), type = "b", col = "blue", pch = 16)
+legend("topright", title = "Kwota kredytu odnawialnego", legend = c("0", "500", "900", "1500", "2000", "6000", "12000"), col = c("brown", "black","red", "green", "purple", "orange", "blue"), pch = 16)
+```
+<p>Sytuacja jest analogiczna do tej w poprzedniem przypadku, to znaczy, wraz ze wzrostem posiadanych produktów jak i całkowitej kwoty kredytu odnawialnego spada szansa rezygnacji z usług bankowych.</p>
+
+<h2>Analiza podgrupy klientów</h2>
+<p>Posiadając już wiedzę, że bardzo mała i bardzo duża liczba transakcji w roku dominuje prawdopodobieństwo zdarzenia, że klient zakończy relację z bankiem, możemy wybrać podgrupę klientów, którzy wykonali więcej niż 60 transakcji w roku i zrezygnowali z usług banku, aby lepiej zrozumieć tę grupę.</p>
+```{r, fig.width = 12, fig.height = 7}
+Attrited_customers_with_TTC_greater_60 <- Attrited_customers_data[Attrited_customers_data$Total_Trans_Ct > 60,]
+Attrited_customers_with_TTC_less_60 <- suppressMessages(anti_join(Attrited_customers_data, Attrited_customers_with_TTC_greater_60))
+
+plot(Existing_customers_data$Total_Trans_Ct)
+points(Attrited_customers_with_TTC_greater_60$Total_Trans_Ct~seq(1,8500, 8500/nrow(Attrited_customers_with_TTC_greater_60)), col = "red", pch = 16)
+points(Attrited_customers_with_TTC_less_60$Total_Trans_Ct~seq(1,8500, 8500/nrow(Attrited_customers_with_TTC_less_60)), col = "blue", pch = 16)
+```
+<p>Na wykresie zaprezentowaliśmy wszystkich klientów z naszego zbioru danych. Czarne punkty to aktywni klienci, niebieskie to klienci, którzy zrezygnowali i mieli co najwyżej 60 transakcji w roku, natomiast pozostałe czerwone punkty to interesujący nas przypadek klientów, którzy zrezygnowali z usług banku, ale ich liczba transakcji w roku była większa niż 60. Przyjrzyjmy się dokładniej aktywnym klientom oraz interesjącej nas grupie.</p>
+```{r, fig.width = 12, fig.height = 7}
+plot(Existing_customers_data$Total_Trans_Ct)
+points(Attrited_customers_with_TTC_greater_60$Total_Trans_Ct~seq(1,8500, 8500/nrow(Attrited_customers_with_TTC_greater_60)), col = "red", pch = 16)
+```
+<p>Dzięki wykresowi widać, dlaczego jest to tak ciekawy przypadek. Mianowicie, wszyscy klienci z ilością transakcji w roku większą niż 60, są w paśmie średniej ilości transakcji dla klientów którzy nie zrezygnowali z usług banku. Rozróżnienie obu tych grup jest kluczowe do identyfikacji klientów, którzy mogą zrezygnować z usług banku.</p>
+<p>Naszą analizę zaczniemy od wyodrębnienia klientów, którzy nie zrezygnowali z usług banku i wykonali co najmniej 60 transakcji ale nie przekroczyli maksimum z ilości transakcji dla klientów, którzy zrezygnowali. Wyznaczymy podstawowe statystyki dla tej grupy oraz dla grupy klientów, którzy zrezygnowali z usług banku i wykonali więcej niż 60 transakcji w ciągu roku. Wyniki zaprezentujemy w poniższej tabelce.
+</p>
+```{r, fig.width = 10, fig.height = 12}
+Existing_customers_with_TTC_in_interval <- Existing_customers_data[Existing_customers_data$Total_Trans_Ct > 60 &
+                                                                   Existing_customers_data$Total_Trans_Ct <= max(Attrited_customers_data$Total_Trans_Ct),]
+
+summary_list_attr <- sapply(names(reduced_data)[3:14], function(x) list("min" = min(Attrited_customers_with_TTC_greater_60[,x]), "mean" = mean(Attrited_customers_with_TTC_greater_60[,x]), "median" = median(Attrited_customers_with_TTC_greater_60[,x]), "max" = max(Attrited_customers_with_TTC_greater_60[,x])))
+names(summary_list_attr) <- names(reduced_data)[3:14]
+
+summary_list_exist <- sapply(names(reduced_data)[3:14], function(x) list("min" = min(Existing_customers_with_TTC_in_interval[,x]), "mean" = mean(Existing_customers_with_TTC_in_interval[,x]), "median" = median(Existing_customers_with_TTC_in_interval[,x]), "max" = max(Existing_customers_with_TTC_in_interval[,x])))
+names(summary_list_exist) <- names(reduced_data)[3:14]
+
+data_for_table <- data.frame(t(summary_list_attr), t(summary_list_exist))
+names(data_for_table) <- c(rep(names(data_for_table)[1:4], 2))
+kbl(data_for_table) %>%
+  kable_paper(full_width = T) %>%
+  kable_styling(font_size = 16, row_label_position = "c", html_font = "Times New Roman", position = "center") %>%
+  add_header_above(c(" " = 1, "Attrited Customers" = 4, "Existing Customers" = 4)) %>%
+  column_spec(6:9, color = "black", background = "#f7f6f6") %>%
+  row_spec(c(8,9,10), color = "black", background = "#e09797")
+```
+<p>Na czerwono zaznaczyliśmy zmienne, które najbardziej się wyróżniają. Wśród nich jest całkowita kwota kredytu odnawialnego, która średnio jest zdecydowanie mniejsza dla klientów, którzy zrezygnowali z usług banku. Warto też zwrócić uwagę, że mediana dla klientów, którzy zakończyli relację z bankiem wynosi 0. Jest to wynikiem tego, że mniej niż połowa klientów, którzy zrezygnowali z usług banku posiada kredyt odnawialny, bądź ich zobowiązania wobec banku są wyrównane.</p>
+<p>Kolejna zmienna jaka się wyróżnia, to całkowita różnica w kwocie transakcji na przełomie czwartego i pierwszego kwartału (Q4 over Q1). Jest ona średnio większa dla klientów którzy zakończyli relację z bankiem. Analogiczą zmianę możemy dostrzec w całkowitej kwocie transakcji w roku danego klienta.</p>
+<p>Z powyższej analizy możemy wyciągnąć wniosek, że klienci, którzy pomimo standardowej ilości transakcji, dokonują średnio transakcji na większe kwoty oraz nie posiadają zobowiązań wobec banku (takich jak kredyt odnawialny) mają zdecydowanie większą szansę zrezygnować z usług banku.</p>
+
+<h2>Analiza klientów z nieznanym stanem cywilnym</h2>
+<p>Jak już wcześniej zauważyliśmy, istnieją klienci o nieznanym stanie cywilnym, a jest to zmienna, która gra istotną rolę w predykcji, czy klient zakończy relację z bankiem. Warto w takim razie lepiej zrozumieć poszczególne grupy klientów w rozdzieleniu względem ich stanu cywilnego. Zaczniemy od sprawdzenia ile jest poszczególnych klientów o określonym stanie cywilnym w całym zbiorze danych z rozdzieleniem na klientów, którzy zrezygnowali z usług banku i na tych, którzy nie zrezygnowali.</p>
+```{r, fig.width = 9, fig.height = 7}
+df <- data.frame(Attrition = c(rep("Attrited",4), rep("Existing", 4)) ,Status = rep(c("Single", "Married", "Divorced", "Unknown"),2), frequency = c(nrow(Attrited_customers_data[Attrited_customers_data$Marital_Status == 3,]), nrow(Attrited_customers_data[Attrited_customers_data$Marital_Status == 2,]), nrow(Attrited_customers_data[Attrited_customers_data$Marital_Status == 1,]), nrow(Attrited_customers_data[Attrited_customers_data$Marital_Status == 4,]), nrow(Existing_customers_data[Existing_customers_data$Marital_Status == 3,]), nrow(Existing_customers_data[Existing_customers_data$Marital_Status == 2,]), nrow(Existing_customers_data[Existing_customers_data$Marital_Status == 1,]), nrow(Existing_customers_data[Existing_customers_data$Marital_Status == 4,])))
+
+ggplot(df, aes(x=Status, y=frequency, fill=Attrition)) +
+  geom_bar(stat="identity", position=position_dodge()) +
+  scale_fill_manual(values=c('#999999','#E69F00'))
+```
+<p>Najliczniejszymi grupami są klienci, którzy są singlami bądź w związku małżeńskim. Osób o nieznanym stanie cywilnym jest poniżej 800. Jest to tak mało liczna grupa, że możemy wygenerować zbiór, w którym ich nie będzie i sprawdzić, czy ta zmienna nadal jest istotna. W ten sposób sprawdzimy, czy przypadkiem nieznany status nie wpływa znacząco na nasz model.</p>
+```{r}
+data_without_unknown <- data[data$Marital_Status != 4,]
+best_model <- suppressMessages(glmulti("Attrition_Flag", xr = names(data_without_unknown[3:21]), data = data_without_unknown[,2:21], popsize = 50, level = 1, method = "g", plotty = FALSE, marginality = TRUE, deltaB = 0, confsetsize = 1, deltaM = 1000, family = "binomial", report = FALSE))
+```
+<p>Stan cywilny nadal jest istotny w opisie naszego modelu. Oznacza to, że nieznany stan cywilny nie jest wpływowy w naszym modelu. Możemy więc sprawdzić jak pozostałe stany cywilne wpływają na nasz model.</p>
+```{r, fig.width = 12, fig.height = 7}
+Martial_Status_predictions_men <- generate_predictions(Marital_Status = seq(1,3,1), Total_Trans_Ct = 30, Total_Revolving_Bal = 1500)
+Martial_Status_predictions_women <- generate_predictions(Gender = 0, Marital_Status = seq(1,3,1), Total_Trans_Ct = 30, Total_Revolving_Bal = 1500)
+
+plot(predict(reduced_model, newdata = Martial_Status_predictions_men[3:14], type = "response")~seq(1,3,1), type = "b", ylim = c(0,1), pch = 16, xlab = "Stan cywilny", ylab = "prawdopodobieństwo rezygnacji")
+points(predict(reduced_model, newdata = Martial_Status_predictions_women[3:14], type = "response")~seq(1,3,1), type = "b", col = "red", pch = 16)
+
+legend("topright", title = "płeć", legend = c("kobieta", "mężczyzna"), col = c("red", "black"), pch = 16)
+```
+<p>Powyższy wykres prezentuje prawdopodobieństwo rezygnacji klienta względem jego stanu cywilnego, przy optymalnych założeniach, że klient wykonał w ciągu roku 30 transakcji i jego całkowita kwota kredytu odnawialnego wynosi 1500. Według wykresu, stan cywilny nie ma dużego wpływu na prawdopodobieństwo odejścia klienta z banku. Czym zakończymy analizę tej zmiennej.</p>
+
+<h2>Podsumowanie</h2>
+
+<p>Skonstruowany model przewidujący prawdopodobieństwo zdarzenia, że klient zakończy relację z bankiem, wykazał, że najistotniejszym czynnikiem jest to ile klient wykonał transakcji w ciągu roku. Mała ich ilość sugeruje, że klient prawdopodobnie zakończy relację z bankiem. Był to w ogólności czynnik deterministyczny, to znaczy, jego wartość decydowała, czy klient zakończy relację z bankiem.</p>
+<p> Jednak w konkretnym przedziale ilości transakcji było to niewystarczające. Wtedy istotnymi zmiennymi okazały się kwota kredytu odnawialnego i całkowita kwota transakcji wykonanych w ciągu roku. Jeżeli kwota kredytu odnawialnego była niska, bądź klient nie posiadał zobowiązań kredytowych wobec banku, to miał dużo większą szansę zrezygnować z usług. Jeżeli natomiast całkowita kwota transakcji była stosunkowo duża, to klient miał większą szansę zakończyć relację z bankiem.</p>
+<p>Istotnym czynnikiem przy analizie modelu okazała się również ilość posiadanych produktów przez klienta. Ich duża ilość zmniejszała prawdopodobieństwo rezygnacji klienta z banku przy stosunkowo niskiej ilości transakcji w roku.</p>
+<p>Nasz model wykazał także, że kobiety chętniej rezygnują z usług banku, choć może być to niepoprawny wniosek, ponieważ nasz zbiór danych jest niezbalansowany, to znaczy, jest dużo mniej danych osób, które zakończyły relację z bankiem (około 16% danych), z czego kobiety stanowiły około 57%.</p>
+<p>Warto zwrócić uwagę, że zupełnie nieistotne w wyznaczeniu, czy klient zakończy relację z bankiem, okazały się takie zmienne jak wiek i wykształcenie klienta. Równie nieistotne okazały się roczne zarobki, typ karty jaką dysponował klient w banku czy jego limit kredytowy.</p>
